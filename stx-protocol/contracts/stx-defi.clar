@@ -1,4 +1,5 @@
-;; DeFi Yield Farming Protocol 
+;; DeFi Yield Farming Protocol - Version 3
+;; A blockchain-based yield optimization system with sequential farming periods and reward distribution
 
 ;; Constants
 (define-constant ERR-NOT-PROTOCOL-ADMIN (err u1))
@@ -7,7 +8,9 @@
 (define-constant ERR-ALREADY-HARVESTED (err u4))
 (define-constant ERR-WRONG-PROOF-OF-STAKE (err u5))
 (define-constant ERR-LOCK-PERIOD-ACTIVE (err u6))
+(define-constant ERR-INSUFFICIENT-LIQUIDITY (err u7))
 (define-constant ERR-INVALID-PARAMETER (err u8))
+(define-constant ERR-VAULT-EXISTS (err u9))
 (define-constant MAX-VAULT-ID u100) ;; Maximum allowed vault ID
 
 ;; Data Variables
@@ -35,7 +38,8 @@
     principal
     {
         current-vault: uint,
-        harvested-vaults: (list 10 uint),
+        harvested-vaults: (list 20 uint),
+        last-harvest: uint,
         total-harvested: uint
     }
 )
@@ -44,8 +48,15 @@
 (define-map vault-harvests
     {vault: uint, farmer: principal}
     {
+        attempts: uint,
         harvested-at: (optional uint)
     }
+)
+
+;; Events
+(define-map harvest-events
+    uint
+    (list 10 {farmer: principal, harvested-at: uint})
 )
 
 ;; Authorization
@@ -82,8 +93,20 @@
         ;; Validate vault-id is within acceptable range
         (asserts! (<= vault-id MAX-VAULT-ID) ERR-INVALID-PARAMETER)
         
+        ;; Check if vault already exists to prevent overwriting
+        (asserts! (is-none (map-get? yield-vaults vault-id)) ERR-VAULT-EXISTS)
+        
         ;; Validate unlock block is in the future
         (asserts! (>= unlock-block (var-get current-block)) ERR-INVALID-PARAMETER)
+        
+        ;; Validate verification hash is not empty
+        (asserts! (> (len verification-hash) u0) ERR-INVALID-PARAMETER)
+        
+        ;; Validate strategy is not empty
+        (asserts! (> (len strategy) u0) ERR-INVALID-PARAMETER)
+        
+        ;; Validate yield amount is a positive amount
+        (asserts! (> yield-amount u0) ERR-INVALID-PARAMETER)
         
         ;; Set the vault data
         (map-set yield-vaults vault-id
@@ -95,8 +118,12 @@
                 harvested: false
             })
             
-        ;; Update the total liquidity
-        (var-set total-liquidity (+ (var-get total-liquidity) yield-amount))
+        ;; Calculate new liquidity safely
+        (let ((new-liquidity (+ (var-get total-liquidity) yield-amount)))
+            ;; Make sure the addition doesn't overflow
+            (asserts! (>= new-liquidity (var-get total-liquidity)) ERR-INVALID-PARAMETER)
+            ;; Update the total liquidity
+            (var-set total-liquidity new-liquidity))
         (ok true)))
 
 ;; Farmer Onboarding
@@ -110,6 +137,7 @@
             {
                 current-vault: u0,
                 harvested-vaults: (list),
+                last-harvest: u0,
                 total-harvested: u0
             })
         (ok true)))
@@ -140,8 +168,9 @@
                     (merge farmer {
                         current-vault: (+ vault-id u1),
                         harvested-vaults: (unwrap! (as-max-len? 
-                            (append (get harvested-vaults farmer) vault-id) u10)
+                            (append (get harvested-vaults farmer) vault-id) u20)
                             ERR-INVALID-VAULT),
+                        last-harvest: current-height,
                         total-harvested: (+ (get total-harvested farmer) u1)
                     }))
                 
@@ -149,11 +178,22 @@
                 (map-set vault-harvests
                     {vault: vault-id, farmer: tx-sender}
                     {
+                        attempts: u1,
                         harvested-at: (some current-height)
                     })
                 
                 ;; Distribute yield
                 (try! (stx-transfer? (get yield-amount vault) (var-get protocol-admin) tx-sender))
+                
+                ;; Record event
+                (match (map-get? harvest-events vault-id)
+                    events (map-set harvest-events vault-id
+                        (unwrap! (as-max-len?
+                            (append events {farmer: tx-sender, harvested-at: current-height})
+                            u10)
+                            ERR-INVALID-VAULT))
+                    (map-set harvest-events vault-id
+                        (list {farmer: tx-sender, harvested-at: current-height})))
                 
                 (ok true))
             ERR-WRONG-PROOF-OF-STAKE)))
@@ -169,8 +209,8 @@
 (define-read-only (get-farmer-status (farmer principal))
     (map-get? farmer-positions farmer))
 
-(define-read-only (get-vault-harvest (vault-id uint) (farmer principal))
-    (map-get? vault-harvests {vault: vault-id, farmer: farmer}))
+(define-read-only (get-harvest-events (vault-id uint))
+    (map-get? harvest-events vault-id))
 
 (define-read-only (get-current-block)
     (var-get current-block))
